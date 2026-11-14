@@ -1,6 +1,6 @@
 import z from "zod";
 
-import { User } from "../../models/user.model.js";
+import { User } from "../../database/models/user.model.js";
 import type { KoaController } from "../../utils/KoaController.js";
 import { postgres } from "../../server.js";
 import { joinOrCreateWorld } from "../../services/maproom/v2/joinOrCreateWorld.js";
@@ -11,8 +11,17 @@ import { Status } from "../../enums/StatusCodes.js";
 import { Env } from "../../enums/Env.js";
 import { joinNewWorldMap } from "../../services/maproom/v3/joinNewWorldMap.js";
 import { extractTownHall } from "../../utils/extractTownHall.js";
-import { discordAgeErr, townHallLevelErr } from "../../errors/errors.js";
-import { Maproom } from "../../models/maproom.model.js";
+import {
+  discordAgeErr,
+  mustLeaveAllianceToChangeWorldErr,
+  townHallLevelErr,
+} from "../../errors/errors.js";
+import { Maproom } from "../../database/models/maproom.model.js";
+import { clearPendingInvites } from "../../services/alliance/allianceInvites.js";
+import { MAX_RESOURCE_CAPACITY } from "../../config/MapRoom2Config.js";
+import { RESOURCE_KEYS } from "../../services/base/updateResources.js";
+import { removeAllNeighbours } from "../../services/maproom/neighbours/neighbours.js";
+import { BaseType } from "../../enums/Base.js";
 
 /**
  * Schema for validating the request body when setting the map version.
@@ -43,17 +52,36 @@ export const setMapVersion: KoaController = async (ctx) => {
   if (!ctx.meetsDiscordAgeCheck) throw discordAgeErr();
 
   switch (version) {
-    case MapRoomVersion.NONE:
-      await leaveWorld(user, save);
+    case MapRoomVersion.NONE: {
+      if (user.alliance_id) throw mustLeaveAllianceToChangeWorldErr();
+
+      await clearPendingInvites(user.userid);
+
+      if (save.mapversion === MapRoomVersion.V3 && save.resources) {
+        for (const key of RESOURCE_KEYS) {
+          if (Number(save.resources[key]) > MAX_RESOURCE_CAPACITY)
+            save.resources[key] = MAX_RESOURCE_CAPACITY;
+        }
+      }
+
       save.mapversion = MapRoomVersion.V1;
+      await leaveWorld(user, save);
       break;
+    }
 
     case MapRoomVersion.V1:
       save.mapversion = MapRoomVersion.V1;
       break;
 
     case MapRoomVersion.V2: {
-      if (save.mapversion === MapRoomVersion.V3) break;
+      const isMapRoom3 = save.mapversion === MapRoomVersion.V3;
+      const inMapRoom2 = save.mapversion === MapRoomVersion.V2 && Boolean(save.worldid);
+
+      if (isMapRoom3 || inMapRoom2) break;
+
+      if (user.alliance_id) throw mustLeaveAllianceToChangeWorldErr();
+
+      await clearPendingInvites(user.userid);
 
       const townHall = extractTownHall(save.buildingdata ?? {});
 
@@ -66,10 +94,16 @@ export const setMapVersion: KoaController = async (ctx) => {
       const maproom1 = await postgres.em.findOne(Maproom, { userid: user.userid });
 
       if (maproom1) postgres.em.remove(maproom1);
+
+      await removeAllNeighbours(user.userid, BaseType.MAIN);
       break;
     }
 
     case MapRoomVersion.V3:
+      if (user.alliance_id) throw mustLeaveAllianceToChangeWorldErr();
+
+      await clearPendingInvites(user.userid);
+
       const townHall = extractTownHall(save.buildingdata ?? {});
 
       if (!save.mr2upgraded && (!townHall || townHall.l < 6)) throw townHallLevelErr();
@@ -80,6 +114,8 @@ export const setMapVersion: KoaController = async (ctx) => {
       const maproom1 = await postgres.em.findOne(Maproom, { userid: user.userid });
 
       if (maproom1) postgres.em.remove(maproom1);
+
+      await removeAllNeighbours(user.userid, BaseType.MAIN);
       break;
   }
   postgres.em.persist(save);

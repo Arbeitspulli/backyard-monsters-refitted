@@ -1,20 +1,26 @@
 import { Status } from "../../enums/StatusCodes.js";
 import { TruceStatus } from "../../enums/TruceStatus.js";
 import { MessageType } from "../../enums/MessageType.js";
-import { User } from "../../models/user.model.js";
+import { User } from "../../database/models/user.model.js";
 import type { KoaController } from "../../utils/KoaController.js";
 import { devConfig } from "../../config/GameConfig.js";
 import { SendMessageSchema } from "./zod/SendMessageSchema.js";
 import { postgres } from "../../server.js";
-import { Message } from "../../models/message.model.js";
+import { Message } from "../../database/models/message.model.js";
 import { getCurrentDateTime } from "../../utils/getCurrentDateTime.js";
 import { findOrCreateThread } from "../../services/mail/findOrCreateThread.js";
 import { countUnreadMessage } from "../../services/mail/countUnreadMessage.js";
 import { handleTruceRequest } from "../../services/mail/handleTruceRequest.js";
 import { handleTruceResponse } from "../../services/mail/handleTruceResponse.js";
+import { handleMigrateInvite, handleMigrateRevoke, type InviteRecipient } from "../../services/mail/handleMigrateInvite.js";
 import { mailboxErr } from "../../errors/errors.js";
 import { logger } from "../../utils/logger.js";
-import type { MessageData } from "../../types/EntityData.js";
+
+const RECIPIENT_FIELDS = [
+  "blockedUsers",
+  "save.unreadmessages",
+  "save.mapversion",
+] as const;
 
 /**
  * Controller to send message
@@ -59,7 +65,7 @@ export const sendMessage: KoaController = async (ctx) => {
     const recipient = await postgres.em.findOne(
       User,
       { userid: messageTargetId },
-      { populate: ["save"] }
+      { populate: ["save"], fields: RECIPIENT_FIELDS }
     );
 
     if (!recipient || !recipient.save) {
@@ -75,6 +81,11 @@ export const sendMessage: KoaController = async (ctx) => {
       return;
     }
 
+    const invited: InviteRecipient = {
+      userid: messageTargetId,
+      mapversion: recipient.save.mapversion,
+    };
+
     switch (message.type) {
       case MessageType.TRUCE_REQUEST:
         await handleTruceRequest(userid, messageTargetId, thread);
@@ -83,9 +94,17 @@ export const sendMessage: KoaController = async (ctx) => {
       case MessageType.TRUCE_ACCEPT:
         await handleTruceResponse(userid, thread, TruceStatus.ACCEPTED);
         break;
-        
+
       case MessageType.TRUCE_REJECT:
         await handleTruceResponse(userid, thread, TruceStatus.REJECTED);
+        break;
+
+      case MessageType.MIGRATE_REQUEST:
+        await handleMigrateInvite(userid, invited, message.baseid, thread);
+        break;
+
+      case MessageType.MIGRATE_REVOKE:
+        await handleMigrateRevoke(userid, thread);
         break;
     }
 
@@ -99,7 +118,7 @@ export const sendMessage: KoaController = async (ctx) => {
       subject: filteredSubject,
       message: filteredMessage,
       updatetime: getCurrentDateTime(),
-    } as unknown as MessageData);
+    });
 
     thread.messagecount++;
     thread.lastMessage = newMessage;

@@ -1,5 +1,5 @@
 import { devConfig } from "../config/GameConfig.js";
-import { User } from "../models/user.model.js";
+import { User } from "../database/models/user.model.js";
 import { getCurrentDateTime } from "../utils/getCurrentDateTime.js";
 import { Reward } from "../enums/Rewards.js";
 import { BaseType } from "../enums/Base.js";
@@ -26,9 +26,8 @@ export const getDefaultBaseData = (user: User, baseType: BaseType) => {
   return {
     saveuserid: user.userid,
     userid: user.userid,
-    cellid: -1,
     name: user.username,
-    credits: devConfig.shiny || 10000,
+    credits: devConfig.shiny || 1000,
     createtime: currentTime,
     protected: currentTime + sevenDays,
 
@@ -57,8 +56,6 @@ export const getDefaultBaseData = (user: User, baseType: BaseType) => {
     rewards: devConfig.unlockAllEventRewards
       ? {
           // Default event rewards
-          unblockSlimeattikus: { id: Reward.SLIMEATTIKUS },
-          unblockVorg: { id: Reward.VORG },
           goldenDAVE: { id: Reward.GOLDEN_DAVE },
           improvedHCC: { id: Reward.IMPROVED_HCC },
           extraTiles: { id: Reward.EXTRA_TILES },

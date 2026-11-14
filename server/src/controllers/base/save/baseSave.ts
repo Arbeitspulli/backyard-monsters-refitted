@@ -1,8 +1,8 @@
 import type { KoaController } from "../../../utils/KoaController.js";
-import { Save } from "../../../models/save.model.js";
-import { User } from "../../../models/user.model.js";
+import { Save } from "../../../database/models/save.model.js";
+import { User } from "../../../database/models/user.model.js";
 import { postgres, redis } from "../../../server.js";
-import { FilterFrontendKeys } from "../../../utils/FrontendKey.js";
+import { buildSaveData, mapSaveData } from "../../../services/base/mapSaveData.js";
 import { getCurrentDateTime } from "../../../utils/getCurrentDateTime.js";
 import { logger } from "../../../utils/logger.js";
 import { Status } from "../../../enums/StatusCodes.js";
@@ -11,19 +11,23 @@ import { BaseSaveSchema } from "../../../schemas/BaseSaveSchema.js";
 import { resourcesHandler } from "./handlers/resourceHandler.js";
 import { purchaseHandler } from "./handlers/purchaseHandler.js";
 import { academyHandler } from "./handlers/academyHandler.js";
-import { mapUserSaveData } from "../mapUserSaveData.js";
 import { BaseType } from "../../../enums/Base.js";
 import { permissionErr, saveFailureErr } from "../../../errors/errors.js";
 import { attackLootHandler } from "./handlers/attackLootHandler.js";
+import { defenderLootHandler } from "./handlers/defenderLootHandler.js";
 import { monsterUpdateHandler } from "./handlers/monsterUpdateHandler.js";
 import { validateSave } from "../../../scripts/anticheat/anticheat.js";
-import { updateResources } from "../../../services/base/updateResources.js";
+import { getOutpostOwnerSave } from "../../../services/base/getOutpostOwnerSave.js";
+import { advanceBuildingTimers } from "../../../services/base/advanceBuildingTimers.js";
+import { championHandler } from "./handlers/championHandler.js";
 import { buildingDataHandler } from "./handlers/buildingDataHandler.js";
 import { takeoverCellMR3, type TakeoverData } from "../../../services/maproom/v3/takeoverCellMR3.js";
 import { damageProtection } from "../../../services/maproom/v2/damageProtection.js";
+import { acknowledgeGifts, claimGifts } from "../../../services/gifts/gifts.js";
 import { isMR3Structure } from "../../../services/maproom/v3/utils/isMR3Structure.js";
-import { WorldMapCell } from "../../../models/worldmapcell.model.js";
+import { WorldMapCell } from "../../../database/models/worldmapcell.model.js";
 import { MapRoomVersion } from "../../../enums/MapRoom.js";
+import { calculateBaseLevel } from "../../../services/base/calculateBaseLevel.js";
 import { MR1_TRIBE_IDS } from "../../../game-data/tribes/v1/index.js";
 import { scaledMR1Tribes } from "../../../services/maproom/v1/scaledMR1Tribes.js";
 
@@ -48,7 +52,7 @@ export const baseSave: KoaController = async (ctx) => {
 
   if (!baseSave && MR1_TRIBE_IDS.has(saveData.baseid)) {
     const tribeSave = await scaledMR1Tribes(user, saveData);
-    const filteredSave = FilterFrontendKeys(tribeSave);
+    const filteredSave = await mapSaveData(tribeSave, user);
 
     ctx.status = Status.OK;
     ctx.body = { error: 0, ...filteredSave };
@@ -66,16 +70,18 @@ export const baseSave: KoaController = async (ctx) => {
 
   await validateSave(user, baseSave, body);
 
+  const storedHealthData = baseSave.buildinghealthdata;
+
   // Standard save logic
   for (const key of isAttack ? Save.attackSaveKeys : Save.saveKeys) {
     const value = body[key] as string;
 
     switch (key) {
       case SaveKeys.RESOURCES:
-        resourcesHandler(baseSave, value);
         if (isOutpostOwner) {
-          const resources = JSON.parse(value);
-          userSave.resources = updateResources(resources, userSave.resources!);
+          resourcesHandler(userSave, value, { skipCapacity: true });
+        } else {
+          resourcesHandler(baseSave, value);
         }
         break;
 
@@ -88,7 +94,7 @@ export const baseSave: KoaController = async (ctx) => {
         break;
 
       case SaveKeys.IRESOURCES:
-        resourcesHandler(baseSave, value, SaveKeys.IRESOURCES);
+        resourcesHandler(baseSave, value, { key: SaveKeys.IRESOURCES });
         break;
 
       case SaveKeys.ACADEMY:
@@ -109,6 +115,10 @@ export const baseSave: KoaController = async (ctx) => {
         if (isAttack) {
           if (saveData.attackerchampion) {
             userSave.champion = saveData.attackerchampion;
+          }
+
+          if (saveData.champion) {
+            championHandler(saveData.champion, baseSave);
           }
         } else {
           if (saveData.champion) {
@@ -137,7 +147,14 @@ export const baseSave: KoaController = async (ctx) => {
     if (isOutpostOwner) updateOutposts(userSave, baseSave, key);
   }
 
+  if (!isAttack) {
+    await claimGifts(user, saveData.gifts);
+    await acknowledgeGifts(user, saveData.sentgifts);
+  }
+
   if (!isAttack && saveData.purchase) purchaseHandler(ctx, saveData.purchase, userSave);
+
+  const outpostOwnerSave = await getOutpostOwnerSave(baseSave, user);
 
   let takeoverData: TakeoverData | null = null;
 
@@ -152,6 +169,17 @@ export const baseSave: KoaController = async (ctx) => {
 
     if (saveData.attackloot) {
       attackLootHandler(saveData.attackloot, userSave);
+    }
+
+    if (saveData.resources) {
+      const lootTarget = outpostOwnerSave ?? baseSave;
+
+      if (baseSave.type === BaseType.OUTPOST && !outpostOwnerSave) {
+        logger.error(`Outpost ${baseSave.baseid} has no owner main save - loot applied to a dead column`);
+      }
+
+      defenderLootHandler(saveData.resources, lootTarget);
+      postgres.em.persist(lootTarget);
     }
 
     postgres.em.persist(userSave);
@@ -185,8 +213,20 @@ export const baseSave: KoaController = async (ctx) => {
 
   baseSave.attackid = saveData.over ? 0 : baseSave.attackid;
 
+  const now = getCurrentDateTime();
+
+  // Attack saves store health from the attacker's replay but keep buildingdata from the DB,
+  // so the owner's countdowns are brought up to the attack before savetime moves to it.
+  if (isAttack && baseSave.buildingdata) {
+    baseSave.buildingdata = advanceBuildingTimers(baseSave.buildingdata, storedHealthData, now - baseSave.savetime);
+  }
+
   baseSave.id = baseSave.savetime;
-  baseSave.savetime = getCurrentDateTime();
+  baseSave.savetime = now;
+
+  if (baseSave.type === BaseType.MAIN && baseSave.mapversion === MapRoomVersion.V1) {
+    baseSave.level = calculateBaseLevel(baseSave.points, baseSave.basevalue);
+  }
 
   if (!isAttack) {
     await redis.setex(`last-seen:main:${user.userid}`, 120, getCurrentDateTime().toString());
@@ -195,7 +235,7 @@ export const baseSave: KoaController = async (ctx) => {
   postgres.em.persist(baseSave);
   await postgres.em.flush();
 
-  const filteredSave = FilterFrontendKeys(baseSave);
+  const filteredSave = buildSaveData(baseSave, user, outpostOwnerSave);
   logger.info(`Saving ${user.username}'s base | IP: ${ctx.ip}`);
 
   const responseBody = {
@@ -204,10 +244,6 @@ export const baseSave: KoaController = async (ctx) => {
     ...filteredSave,
     ...(takeoverData && { takeover: takeoverData }),
   };
-
-  if (user.userid === filteredSave.userid) {
-    Object.assign(responseBody, mapUserSaveData(user));
-  }
 
   ctx.status = Status.OK;
   ctx.body = responseBody;

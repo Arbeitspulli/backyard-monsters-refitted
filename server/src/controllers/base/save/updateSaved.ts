@@ -4,17 +4,20 @@ import { getFlags } from "../../../game-data/flags.js";
 import { BaseMode, BaseType } from "../../../enums/Base.js";
 import { Status } from "../../../enums/StatusCodes.js";
 import { saveFailureErr } from "../../../errors/errors.js";
-import { Save } from "../../../models/save.model.js";
-import { User } from "../../../models/user.model.js";
+import { Save } from "../../../database/models/save.model.js";
+import { User } from "../../../database/models/user.model.js";
 import { postgres, redis } from "../../../server.js";
-import { FilterFrontendKeys } from "../../../utils/FrontendKey.js";
 import { getCurrentDateTime } from "../../../utils/getCurrentDateTime.js";
 import type { KoaController } from "../../../utils/KoaController.js";
 import { baseModeBuild } from "../load/modes/baseModeBuild.js";
 import { baseModeView } from "../load/modes/baseModeView.js";
 import { infernoModeView } from "../load/modes/infernoModeView.js";
-import { mapUserSaveData } from "../mapUserSaveData.js";
 import { extractTownHall } from "../../../utils/extractTownHall.js";
+import { mapSaveData } from "../../../services/base/mapSaveData.js";
+import { getAllianceData } from "../../../services/alliance/allianceData.js";
+import { runningPowerups } from "../../../services/alliance/powerups.js";
+import { visibleCredits } from "../../../services/user/shinyLock.js";
+import { isEventBase, loadEventBase } from "../../../services/events/replayable/eventBases.js";
 
 const UpdateSavedSchema = z.object({
   type: z.string(),
@@ -53,21 +56,25 @@ export const updateSaved: KoaController = async (ctx) => {
       break;
 
     default:
+      if (isEventBase(baseid)) {
+        baseSave = await loadEventBase(user, baseid);
+        break;
+      }
+
       baseSave = await baseModeView(baseid, mapversion, worldid, user);
       break;
   }
 
   if (!baseSave) throw saveFailureErr();
 
-  baseSave.savetime = getCurrentDateTime();
-  baseSave.id = baseSave.savetime; // client expects this.
+  const isOwner = user.userid === baseSave.userid;
+  const isInferno = baseSave.type === BaseType.INFERNO;
 
-  if (baseid !== BaseMode.DEFAULT && type === BaseMode.BUILD) {
-    postgres.em.persist(baseSave);
-    await postgres.em.flush();
-  }
+  const filteredSave = await mapSaveData(baseSave, user);
+  const savetime = getCurrentDateTime();
 
-  const filteredSave = FilterFrontendKeys(baseSave);
+  filteredSave.savetime = savetime;
+  filteredSave.id = savetime;
 
   const flags = getFlags();
   flags.discordOldEnough = Number(ctx.meetsDiscordAgeCheck);
@@ -76,17 +83,20 @@ export const updateSaved: KoaController = async (ctx) => {
   flags.maproom2 = userSave.mr2upgraded || (townHall && townHall.l >= 6) ? 1 : 0;
   flags.mr2upgraded = userSave.mr2upgraded ? 1 : 0;
 
-  const responseBody = {
+  const credits = visibleCredits(user, userSave.credits);
+
+  const isOwnMainYard = isOwner && !isInferno;
+  
+  const alliance = isOwnMainYard ? await getAllianceData(user) : null;
+  const powerups = isOwnMainYard ? await runningPowerups(user.alliance_id) : null;
+
+  ctx.status = Status.OK;
+  ctx.body = {
     error: 0,
     flags,
     ...filteredSave,
-    credits: userSave.credits
+    credits,
+    ...(alliance && { alliancedata: alliance }),
+    ...(powerups && { powerups }),
   };
-
-  if (baseSave.type !== BaseType.INFERNO && user.userid === filteredSave.userid) {
-    Object.assign(responseBody, mapUserSaveData(user));
-  }
-
-  ctx.status = Status.OK;
-  ctx.body = responseBody;
 };

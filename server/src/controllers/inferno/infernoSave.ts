@@ -3,8 +3,8 @@ import { SaveKeys } from "../../enums/SaveKeys.js";
 import { Status } from "../../enums/StatusCodes.js";
 import { permissionErr } from "../../errors/errors.js";
 import { ClientSafeError } from "../../middleware/clientSafeError.js";
-import { Save } from "../../models/save.model.js";
-import { User } from "../../models/user.model.js";
+import { Save } from "../../database/models/save.model.js";
+import { User } from "../../database/models/user.model.js";
 import { postgres, redis } from "../../server.js";
 import { scaledInfernoTribes } from "../../services/maproom/inferno/scaledInfernoTribes.js";
 import { FilterFrontendKeys } from "../../utils/FrontendKey.js";
@@ -15,9 +15,14 @@ import { BaseSaveSchema } from "../../schemas/BaseSaveSchema.js";
 import { academyHandler } from "../base/save/handlers/academyHandler.js";
 import { attackLootHandler } from "../base/save/handlers/attackLootHandler.js";
 import { buildingDataHandler } from "../base/save/handlers/buildingDataHandler.js";
+import { defenderLootHandler } from "../base/save/handlers/defenderLootHandler.js";
 import { purchaseHandler } from "../base/save/handlers/purchaseHandler.js";
 import { resourcesHandler } from "../base/save/handlers/resourceHandler.js";
 import { damageProtection } from "../../services/maproom/v2/damageProtection.js";
+import { advanceBuildingTimers } from "../../services/base/advanceBuildingTimers.js";
+import { visibleCredits } from "../../services/user/shinyLock.js";
+import { calculateBaseLevel } from "../../services/base/calculateBaseLevel.js";
+import { isEventBase, saveEventBaseAttack } from "../../services/events/replayable/eventBases.js";
 
 export const infernoSave: KoaController = async (ctx) => {
   const user: User = ctx.authUser;
@@ -34,9 +39,11 @@ export const infernoSave: KoaController = async (ctx) => {
     const { basesaveid } = saveData;
     let baseSave = await postgres.em.findOne(Save, { basesaveid });
 
-    // Otherwise, retrieve a moloch tribe and handle tribe save logic
+    // Otherwise, retrieve an event base or a moloch tribe and handle tribe save logic
     if (!baseSave) {
-      const tribeSave = await scaledInfernoTribes(user, saveData);
+      const saveTribeAttack = isEventBase(saveData.baseid) ? saveEventBaseAttack : scaledInfernoTribes;
+      const tribeSave = await saveTribeAttack(user, saveData);
+
       const filteredSave = FilterFrontendKeys(tribeSave);
 
       ctx.status = Status.OK;
@@ -52,6 +59,8 @@ export const infernoSave: KoaController = async (ctx) => {
     const isAttack = !isOwner && baseSave.attackid !== 0;
 
     if (!isOwner && baseSave.attackid === 0) throw permissionErr();
+
+    const storedHealthData = baseSave.buildinghealthdata;
 
     for (const key of isAttack ? Save.attackSaveKeys : Save.saveKeys) {
       const value = body[key] as string;
@@ -104,31 +113,21 @@ export const infernoSave: KoaController = async (ctx) => {
       userInfernoSave.monsters = saveData.attackcreatures;
     }
 
-    // Defender-specific save updates during an attack
     if (isAttack && !isOwner) {
-      const defenderSave = await postgres.em.findOne(Save, {
-        type: BaseType.INFERNO,
-        userid: baseSave.saveuserid,
-      });
+      attackLootHandler(saveData.attackloot, userSave, SaveKeys.IRESOURCES);
 
-      if (defenderSave) {
-        for (const key of Object.keys(saveData) as (keyof typeof saveData)[]) {
-          const value = saveData[key];
+      if (saveData.resources) {
+        const defenderMainSave = await postgres.em.findOne(Save, {
+          saveuserid: baseSave.saveuserid,
+          type: BaseType.MAIN,
+        });
 
-          switch (key) {
-            case SaveKeys.MONSTERS:
-              if (value) defenderSave.monsters = value;
-              break;
+        if (defenderMainSave) {
+          defenderLootHandler(saveData.resources, defenderMainSave, SaveKeys.IRESOURCES);
+          postgres.em.persist(defenderMainSave);
 
-            case SaveKeys.ATTACKLOOT:
-              attackLootHandler(value, userSave, SaveKeys.IRESOURCES);
-              break;
-              
-            default:
-              break;
-          }
+          baseSave.resources = { ...defenderMainSave.iresources };
         }
-        postgres.em.persist(defenderSave);
       }
     }
 
@@ -140,8 +139,18 @@ export const infernoSave: KoaController = async (ctx) => {
       await damageProtection(baseSave);
     }
 
+    const now = getCurrentDateTime();
+
+    if (isAttack && baseSave.buildingdata) {
+      baseSave.buildingdata = advanceBuildingTimers(baseSave.buildingdata, storedHealthData, now - baseSave.savetime);
+    }
+
     baseSave.id = baseSave.savetime;
-    baseSave.savetime = getCurrentDateTime();
+    baseSave.savetime = now;
+
+    if (baseSave.type === BaseType.INFERNO) {
+      baseSave.level = calculateBaseLevel(baseSave.points, baseSave.basevalue);
+    }
 
     if (!isAttack) {
       await redis.setex(`last-seen:inferno:${user.userid}`, 120, getCurrentDateTime().toString());
@@ -153,13 +162,14 @@ export const infernoSave: KoaController = async (ctx) => {
     await postgres.em.flush();
 
     const filteredSave = FilterFrontendKeys(baseSave);
+    const credits = visibleCredits(user, userSave.credits);
 
     ctx.status = Status.OK;
     ctx.body = {
       error: 0,
       ...filteredSave,
       champion: [],
-      credits: userSave.credits,
+      credits,
     };
   } catch (err) {
     logger.error(`Failed to save inferno base for user: ${user.username}: ${err}`);

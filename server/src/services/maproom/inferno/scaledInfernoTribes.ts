@@ -1,16 +1,16 @@
-import type { TypeOf } from "zod";
+import type { z } from "zod";
 import { resourcesHandler } from "../../../controllers/base/save/handlers/resourceHandler.js";
 import { SaveKeys } from "../../../enums/SaveKeys.js";
 import { saveFailureErr } from "../../../errors/errors.js";
-import { InfernoMaproom } from "../../../models/infernomaproom.model.js";
-import { Save } from "../../../models/save.model.js";
-import { User } from "../../../models/user.model.js";
+import { InfernoMaproom } from "../../../database/models/infernomaproom.model.js";
+import { Save } from "../../../database/models/save.model.js";
+import { User } from "../../../database/models/user.model.js";
 import { postgres } from "../../../server.js";
 import { getCurrentDateTime } from "../../../utils/getCurrentDateTime.js";
 import { BaseSaveSchema } from "../../../schemas/BaseSaveSchema.js";
 import { molochTribes } from "../../../game-data/tribes/inferno/molochTribes.js";
 
-type BaseSaveData = TypeOf<typeof BaseSaveSchema>;
+type BaseSaveData = z.infer<typeof BaseSaveSchema>;
 
 /**
  * Persists Inferno tribe attack state (building health, monsters, destroyed) to
@@ -74,7 +74,7 @@ export const scaledInfernoTribes = async (user: User, saveData: BaseSaveData) =>
 
       case SaveKeys.ATTACKLOOT:
         if (userInfernoSave)
-          resourcesHandler(userSave, value, SaveKeys.IRESOURCES);
+          resourcesHandler(userSave, value, { key: SaveKeys.IRESOURCES });
         break;
     }
   }

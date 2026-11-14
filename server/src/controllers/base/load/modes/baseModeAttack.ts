@@ -1,11 +1,11 @@
 import { BaseMode, BaseType } from "../../../../enums/Base.js";
-import { MapRoomCell, MapRoomVersion } from "../../../../enums/MapRoom.js";
-import { World } from "../../../../models/world.model.js";
-import { WorldMapCell } from "../../../../models/worldmapcell.model.js";
+import { AttackPermission, MapRoomCell, MapRoomVersion } from "../../../../enums/MapRoom.js";
+import { World } from "../../../../database/models/world.model.js";
+import { WorldMapCell } from "../../../../database/models/worldmapcell.model.js";
 import { postgres } from "../../../../server.js";
 import { damageProtection } from "../../../../services/maproom/v2/damageProtection.js";
-import { Save } from "../../../../models/save.model.js";
-import { User } from "../../../../models/user.model.js";
+import { Save } from "../../../../database/models/save.model.js";
+import { User } from "../../../../database/models/user.model.js";
 import { tribeSaveHandler } from "../../../../services/maproom/tribeSaveHandler.js";
 import { getCurrentDateTime } from "../../../../utils/getCurrentDateTime.js";
 import { validateRange } from "../../../../services/maproom/v2/validateRange.js";
@@ -13,12 +13,15 @@ import { getGeneratedCells, cellKey } from "../../../../services/maproom/v3/gene
 import { createAttackLog } from "../../../../services/base/createAttackLog.js";
 import { updateResources, Operation } from "../../../../services/base/updateResources.js";
 import { isAttackActive } from "../../../../services/base/isAttackActive.js";
-import { baseUnderAttackErr, baseProtectedErr, userOnlineErr, truceActiveErr } from "../../../../errors/errors.js";
+import { baseUnderAttackErr, baseProtectedErr, userOnlineErr, playerLeftMapRoomErr, notNeighboursErr, truceActiveErr, shinyLockedErr } from "../../../../errors/errors.js";
 import { redis } from "../../../../server.js";
 import { isTruceActive } from "../../../../services/mail/isTruceActive.js";
+import { getFriendIds } from "../../../../services/friends/friendList.js";
 import { MR1_TRIBE_IDS } from "../../../../game-data/tribes/v1/index.js";
-import { registerAttacker } from "../../../../services/maproom/v1/registerAttacker.js";
-import type { BuildingData } from "../../../../types/BuildingData.js";
+import { recordAttack } from "../../../../services/maproom/attackHistory.js";
+import { addNeighbours, areNeighbours } from "../../../../services/maproom/neighbours/neighbours.js";
+import { levelGapFor, requireAttackLevel, type RequireAttackLevel } from "../../../../services/maproom/attackPermission.js";
+import { isShinyLocked } from "../../../../services/user/shinyLock.js";
 import {
   generateNoise,
   getTerrainHeight,
@@ -60,13 +63,38 @@ export const baseModeAttack = async ({ user, baseid, mapversion, attackCost }: B
 
   if (!save) throw new Error(`Save not found for baseid: ${baseid}`);
 
+  let permission = AttackPermission.ATTACKABLE;
+
   if (save.type !== BaseType.TRIBE) {
     if (save.protected > getCurrentDateTime()) throw baseProtectedErr();
 
     if (isAttackActive(save)) throw baseUnderAttackErr();
 
     if (save.type === BaseType.MAIN) {
+      const isMR1Attack = mapversion === MapRoomVersion.V1;
+      const hasLeftMR1 = save.mapversion !== MapRoomVersion.V1;
+
+      if (isMR1Attack && hasLeftMR1) throw playerLeftMapRoomErr();
+
+      if (isMR1Attack) {
+        const isNeighbour = await areNeighbours(user.userid, save.saveuserid, BaseType.MAIN);
+
+        if (!isNeighbour) throw notNeighboursErr();
+      }
+
+      const attack: RequireAttackLevel = {
+        attackerId: user.userid,
+        defenderId: save.saveuserid,
+        attackerSave: userSave,
+        defenderSave: save,
+        type: BaseType.MAIN,
+        levelGap: levelGapFor(mapversion),
+      };
+
+      permission = await requireAttackLevel(attack);
+
       const lastSeen = await redis.get(`last-seen:${BaseType.MAIN}:${save.userid}`);
+      
       if (lastSeen && parseInt(lastSeen) >= getCurrentDateTime() - 60) throw userOnlineErr();
     }
 
@@ -77,12 +105,15 @@ export const baseModeAttack = async ({ user, baseid, mapversion, attackCost }: B
 
   if (save.attacks.length > 3) save.attacks = save.attacks.slice(-2);
 
+  const friendIds = await getFriendIds(save.userid);
+  const friend = friendIds.has(user.userid) ? 1 : 0;
+
   // Track the details of the attack
   const attackDetails: AttackDetails = {
     fbid: "",
     name: user.username,
     pic_square: user.pic_square ?? undefined,
-    friend: 0,
+    friend,
     count: 1,
     starttime: getCurrentDateTime(),
     seen: false,
@@ -137,35 +168,15 @@ export const baseModeAttack = async ({ user, baseid, mapversion, attackCost }: B
       const [r1, r2, r3] = attackCost.resources;
       updateResources({ r1, r2, r3 }, userSave.resources!, Operation.SUBTRACT);
     } else if (attackCost.shiny) {
+      const shinyLocked = isShinyLocked(user);
+
+      if (shinyLocked) throw shinyLockedErr();
+      
       userSave.credits = Math.max(0, userSave.credits - attackCost.shiny);
     }
   }
 
   const isMR1Tribe = mapversion === MapRoomVersion.V1 && save.type === BaseType.TRIBE;
-
-  // Clean buildingdata for outposts:
-  // Strips building keys (cB/cU/prefab) for any building which should have finished:
-  // construction, upgrades or kit placements. Avoids serving outdated building states for outposts.
-  if (save.type === BaseType.OUTPOST && save.buildingdata) {
-    const currentTime = getCurrentDateTime();
-    const updatedBuildings: Record<string, BuildingData> = {};
-    let changed = false;
-
-    for (const [key, building] of Object.entries(save.buildingdata)) {
-      const cBExpired = building.cB && save.savetime + building.cB <= currentTime;
-      const cUExpired = building.cU && save.savetime + building.cU <= currentTime;
-
-      if (cBExpired || cUExpired) {
-        const { cB, cU, prefab, ...rest } = building;
-        updatedBuildings[key] = rest;
-        changed = true;
-      } else {
-        updatedBuildings[key] = building;
-      }
-    }
-
-    if (changed) save.buildingdata = updatedBuildings;
-  }
 
   if (!isMR1Tribe) postgres.em.persist(save);
 
@@ -180,7 +191,14 @@ export const baseModeAttack = async ({ user, baseid, mapversion, attackCost }: B
 
     if (!defender) throw new Error("Defender user not found.");
 
-    if (mapversion === MapRoomVersion.V1) await registerAttacker(user, defender);
+    if (save.type === BaseType.MAIN) {
+      await recordAttack(user.userid, defender.userid, BaseType.MAIN, permission);
+    }
+
+    if (mapversion === MapRoomVersion.V1) {
+      await addNeighbours(user.userid, [defender.userid], BaseType.MAIN);
+    }
+    
     await createAttackLog(user, defender, save)
   }
 

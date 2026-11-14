@@ -1,7 +1,7 @@
 import type { KoaController } from "../../../utils/KoaController.js";
-import { User } from "../../../models/user.model.js";
+import { User } from "../../../database/models/user.model.js";
 import { postgres } from "../../../server.js";
-import { WorldMapCell } from "../../../models/worldmapcell.model.js";
+import { WorldMapCell } from "../../../database/models/worldmapcell.model.js";
 import { Status } from "../../../enums/StatusCodes.js";
 import { BaseType } from "../../../enums/Base.js";
 import { getCurrentDateTime } from "../../../utils/getCurrentDateTime.js";
@@ -12,8 +12,9 @@ import {
 import { joinOrCreateWorld } from "../../../services/maproom/v2/joinOrCreateWorld.js";
 import { leaveWorld } from "../../../services/maproom/v2/leaveWorld.js";
 import { MapRoomCell } from "../../../enums/MapRoom.js";
-import { relocateOutpostErr } from "../../../errors/errors.js";
+import { mustLeaveAllianceToChangeWorldErr, relocateOutpostErr, shinyLockedErr } from "../../../errors/errors.js";
 import { MigrateBaseSchema } from "../../../schemas/MigrateBaseSchema.js";
+import { isShinyLocked } from "../../../services/user/shinyLock.js";
 
 /**
  * Cooldown period for base migration.
@@ -38,6 +39,10 @@ export const migrateBase: KoaController = async (ctx) => {
   const { baseid, resources, shiny, type } = MigrateBaseSchema.parse(ctx.request.body);
 
   const currentUser: User = ctx.authUser;
+  const shinyLocked = isShinyLocked(currentUser);
+
+  if (shiny && shinyLocked) throw shinyLockedErr();
+
   await postgres.em.populate(currentUser, ["save"]);
 
   const userSave = currentUser.save!;
@@ -57,6 +62,7 @@ export const migrateBase: KoaController = async (ctx) => {
   // User is relocating due to their empire being overrun.
   if (type === BaseType.RANDOM) {
     if (userSave.outposts.length > 0) throw relocateOutpostErr();
+    if (currentUser.alliance_id) throw mustLeaveAllianceToChangeWorldErr();
 
     await leaveWorld(currentUser, userSave);
     await joinOrCreateWorld(currentUser, userSave, postgres.em, true);

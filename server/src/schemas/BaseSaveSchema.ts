@@ -1,5 +1,6 @@
 import z from "zod";
-import type { ChampionData } from "../types/ChampionData.js";
+import { ChampionListSchema } from "./ChampionSchema.js";
+import { GiftIdsSchema } from "./GiftSchemas.js";
 import type { Resources } from "../services/base/updateResources.js";
 
 /**
@@ -35,24 +36,17 @@ export const BaseSaveSchema = z.object({
     ),
 
   /**
-   * The champion data, transformed from a JSON string to a typed array.
-   * This property is optional.
+   * The champions belonging to the base being saved. During an attack this is
+   * the defender's, reported by the attacking client.
    * @type {ChampionData[] | undefined}
    */
-  champion: z
-    .string()
-    .optional()
-    .transform((data) => (data ? (JSON.parse(data) as ChampionData[]) : undefined)),
+  champion: ChampionListSchema,
 
   /**
-   * The attacker champion data, transformed from a JSON string to a typed array.
-   * This property is optional.
+   * The attacking player's own champions, sent alongside `champion`.
    * @type {ChampionData[] | undefined}
    */
-  attackerchampion: z
-    .string()
-    .optional()
-    .transform((data) => (data ? (JSON.parse(data) as ChampionData[]) : undefined)),
+  attackerchampion: ChampionListSchema,
 
   /**
    * The building data, transformed from a JSON string to an object.
@@ -91,6 +85,16 @@ export const BaseSaveSchema = z.object({
    * @type {object | undefined}
    */
   attackloot: z
+    .string()
+    .optional()
+    .transform((data) => (data ? (JSON.parse(data) as Resources) : undefined)),
+
+  /**
+   * The resource delta for the base being saved. During an attack this is the
+   * defender's, reported by the attacking client.
+   * @type {Resources | undefined}
+   */
+  resources: z
     .string()
     .optional()
     .transform((data) => (data ? (JSON.parse(data) as Resources) : undefined)),
@@ -139,6 +143,28 @@ export const BaseSaveSchema = z.object({
     .string()
     .optional()
     .transform((data) => data !== undefined ? parseInt(data, 10) : undefined),
+
+  /**
+   * The attacker's tutorial stage, transformed from a string to a number, or undefined.
+   * Sent with every save, including attack saves.
+   * @type {number | undefined}
+   */
+  tutorialstage: z
+    .string()
+    .optional()
+    .transform((data) => data !== undefined ? parseInt(data, 10) : undefined),
+
+  /**
+   * The gifts the client collected this session, by id.
+   * @type {number[]}
+   */
+  gifts: GiftIdsSchema,
+
+  /**
+   * The accepted gifts the client has shown their sender, by id.
+   * @type {number[]}
+   */
+  sentgifts: GiftIdsSchema,
 
   /**
    * The attack ID, transformed from a string to a number, or undefined.

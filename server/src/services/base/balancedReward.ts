@@ -1,5 +1,5 @@
 import { KorathReward, Reward } from "../../enums/Rewards.js";
-import { Save } from "../../models/save.model.js";
+import { Save } from "../../database/models/save.model.js";
 import { extractTownHall, type TownHall } from "../../utils/extractTownHall.js";
 
 const INITIAL_KRALLEN_DATA = { countdown: 443189, wins: 5, tier: 5, loot: 750000000000 };
@@ -7,24 +7,34 @@ const INITIAL_KRALLEN_DATA = { countdown: 443189, wins: 5, tier: 5, loot: 750000
 /**
  * Adds rewards to the user's save data based on their Town Hall level.
  *
- * Town Hall Level 6: Korath
- * Town Hall Level 7: Krallen
- * Town Hall Level 8: Diamond Spurtz
+ * Town Hall Level 5: Vorg and Slimeattikus unblocked, so they can be researched
+ * Town Hall Level 6: Krallen
+ * Town Hall Level 7: Korath
+ * Town Hall Level 8: Rezghul
  *
  * @param {Save} userSave - The user's save data.
  * @returns {Promise<void>} A promise that resolves when the balanced rewards are added.
  */
 export const balancedReward = async (userSave: Save) => {
   let rewards = userSave.rewards!;
-  const { KORATH, KRALLEN, REZGHUL, DIAMOND_SPURTZ } = Reward;
+  const { VORG, SLIMEATTIKUS, KORATH, KRALLEN, REZGHUL } = Reward;
 
   // Early return if all rewards are already assigned
-  if (rewards[KORATH] && rewards[KRALLEN] && rewards[DIAMOND_SPURTZ]) return;
+  if (rewards[VORG] && rewards[SLIMEATTIKUS] && rewards[KORATH] && rewards[KRALLEN] && rewards[REZGHUL]) return;
 
   const townHall: TownHall | null = extractTownHall(userSave.buildingdata ?? {});
   if (!townHall || !townHall.l) return;
 
   let townHallLevel = townHall.l;
+
+  // Town Hall Level 5
+  if (townHallLevel >= 5 && !rewards[VORG]) {
+    rewards[VORG] = { id: VORG };
+  }
+
+  if (townHallLevel >= 5 && !rewards[SLIMEATTIKUS]) {
+    rewards[SLIMEATTIKUS] = { id: SLIMEATTIKUS };
+  }
 
   // Town Hall Level 6
   if (townHallLevel >= 6 && !rewards[KRALLEN]) {
@@ -48,11 +58,6 @@ export const balancedReward = async (userSave: Save) => {
   // Town Hall Level 8
   if (townHallLevel >= 8 && !rewards[REZGHUL]) {
     rewards[REZGHUL] = { id: REZGHUL };
-  }
-
-  // Town Hall Level 9
-  if (townHallLevel >= 9 && !rewards[DIAMOND_SPURTZ]) {
-    rewards[DIAMOND_SPURTZ] = { id: DIAMOND_SPURTZ };
   }
 };
 
